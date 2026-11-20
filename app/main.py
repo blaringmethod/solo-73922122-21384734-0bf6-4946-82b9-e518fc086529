@@ -24,7 +24,9 @@ DB_PATH = os.environ.get("WEIGHTS_DB", "/data/weights.db")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     app.state.db = Database(DB_PATH)
     app.state.jobs = JobManager(app.state.db)
     yield
@@ -54,10 +56,12 @@ def jobs() -> JobManager:
 
 # ---------------------------------------------------------------- 输入更正
 @app.put("/samples", status_code=200, tags=["输入数据"],
-         summary="整体替换样本（至多 200 人；使所有旧结果与在途计算失效）")
+         summary="整体替换样本（至多 200 人；使旧结果与在途计算失效）")
 def put_samples(payload: SamplesPayload):
     samples = [s.model_dump() for s in payload.samples]
     epoch = db().replace_samples(samples)
+    # 更正立即返回，不等待旧作业退出；旧作业在下一个可中断点自行放弃。
+    jobs().notify_input_changed()
     return {"epoch": epoch, "count": len(samples),
             "message": "样本已更新，旧结果与在途计算已永久失效，须重新计算"}
 
@@ -73,6 +77,8 @@ def get_samples():
 def put_targets(payload: TargetsPayload):
     targets = [t.model_dump() for t in payload.targets]
     epoch = db().replace_targets(targets)
+    # 更正立即返回，不等待旧作业退出；旧作业在下一个可中断点自行放弃。
+    jobs().notify_input_changed()
     return {"epoch": epoch, "count": len(targets),
             "message": "目标已更新，旧结果与在途计算已永久失效，须重新计算"}
 
@@ -87,12 +93,12 @@ def get_targets():
 @app.post("/calculate", status_code=202, tags=["计算"],
           summary="提交后台权重计算（不阻塞，返回 job_id）")
 def calculate():
-    snap = db().snapshot()
-    if not snap["samples"]:
-        raise HTTPException(422, "当前没有样本，无法计算：请先 PUT /samples")
-    if not snap["targets"]:
-        raise HTTPException(422, "当前没有目标，无法计算：请先 PUT /targets")
     job = jobs().submit()
+    if job is None:
+        # 校验与建作业在同一把锁内完成，避免“校验通过但快照为空”的竞态
+        raise HTTPException(
+            422, "当前没有样本或没有目标，无法计算：请先 PUT /samples 与 /targets"
+        )
     return JSONResponse(
         status_code=202,
         content={"job_id": job["job_id"], "epoch": job["epoch"],

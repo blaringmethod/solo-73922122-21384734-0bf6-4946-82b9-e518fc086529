@@ -9,14 +9,20 @@
 可行性由线性规划 (LP) 独立判定，QP 的数值失败绝不被当作“无解”。
 无可行解时返回一个最小不可行目标子集（IIS）：删去其中任一项目标后，
 其余目标在个人权重界限下变为可行。
+
+取消：所有阶段都在可中断的迭代点调用 ``cancellation.checkpoint``；
+不可中断的 HiGHS ``linprog`` 调用返回后立即检查，已取消则抛出
+:class:`app.cancellation.JobCancelled`，不再做任何后续计算。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import linprog, minimize
+
+from .cancellation import CancelToken, JobCancelled, checkpoint
 
 TOL = 1.0e-10          # 内部数值容差
 RESIDUAL_TOL = 1.0e-6  # 对外承诺的目标合计误差上限
@@ -83,11 +89,14 @@ def lp_feasible(
     p: np.ndarray,
     d: np.ndarray,
     rows: list[int] | None = None,
+    cancel: CancelToken | None = None,
 ) -> _LPFeasibility:
     """判定给定目标行子集在个人权重界限下是否可行。
 
     变量 x = (w_1..w_n, s_1..s_m)，约束  A' w - s = p，s >= 0，min sum(s)。
+    HiGHS 调用本身不可中断；返回后立刻检查取消，绝不再解释结果。
     """
+    checkpoint(cancel)
     if rows is None:
         rows = list(range(a.shape[0]))
     a2 = a[rows, :] if rows else np.zeros((0, a.shape[1]))
@@ -116,8 +125,12 @@ def lp_feasible(
                 options={"presolve": True},
             )
         except Exception as exc:  # pragma: no cover - 防御性
+            # 即使底层调用以异常告终，取消也必须优先于“数值失败”判定
+            checkpoint(cancel)
             best = _LPFeasibility(False, np.nan, -99, f"lp exception: {exc}")
             continue
+        # 不可中断的底层调用已返回：立即释放计算位，不再解释其返回值
+        checkpoint(cancel)
         if res.status == 0:
             slack = res.x[n:]
             s_min = float(np.min(slack))
@@ -137,13 +150,15 @@ def lp_feasible(
     return best
 
 
-def find_iis(a: np.ndarray, p: np.ndarray, d: np.ndarray) -> list[int]:
+def find_iis(a: np.ndarray, p: np.ndarray, d: np.ndarray,
+             cancel: CancelToken | None = None) -> list[int]:
     """返回最小不可行目标行索引集合（删去其中任一项即变可行）。
 
     采用标准贪心删除法：逐行尝试删除，删除后仍不可行则永久删除，
-    最终剩下的每行都是不可行性的必要条件。
+    最终剩下的每行都是不可行性的必要条件。每次试探前都可中断。
     """
-    full = lp_feasible(a, p, d)
+    checkpoint(cancel)
+    full = lp_feasible(a, p, d, cancel=cancel)
     if np.isnan(full.slack_min):
         raise SolverError("可行性 LP 数值失败，无法判定冲突目标")
     if full.feasible:
@@ -151,16 +166,20 @@ def find_iis(a: np.ndarray, p: np.ndarray, d: np.ndarray) -> list[int]:
 
     kept = list(range(a.shape[0]))
     for idx in list(kept):
+        checkpoint(cancel)
         trial = [r for r in kept if r != idx]
-        probe = lp_feasible(a, p, d, trial)
+        probe = lp_feasible(a, p, d, trial, cancel=cancel)
         if np.isnan(probe.slack_min):
             raise SolverError("可行性 LP 数值失败，无法完成冲突定位")
         if not probe.feasible:
             kept = trial  # idx 对冲突并非必要，删除
     # 防御性核验：kept 不可行，且删去任意一行后可行
-    assert not lp_feasible(a, p, d, kept).feasible
+    checkpoint(cancel)
+    assert not lp_feasible(a, p, d, kept, cancel=cancel).feasible
     for idx in kept:
-        assert lp_feasible(a, p, d, [r for r in kept if r != idx]).feasible
+        checkpoint(cancel)
+        assert lp_feasible(a, p, d, [r for r in kept if r != idx],
+                           cancel=cancel).feasible
     return kept
 
 
@@ -181,7 +200,22 @@ def _residuals(w: np.ndarray, a: np.ndarray, p: np.ndarray) -> tuple[float, floa
     return float(np.sum(np.abs(r))), float(np.max(np.abs(r)))
 
 
-def _slsqp(a: np.ndarray, p: np.ndarray, d: np.ndarray) -> np.ndarray:
+def _scipy_callback(stage: str, cancel: CancelToken | None):
+    """构造 scipy 迭代回调；每个迭代点检查取消。
+
+    回调抛出的异常会原样穿透 ``minimize``，因此 :class:`JobCancelled`
+    能立刻终结底层优化，而不是等它跑完。
+    """
+
+    def _cb(*_args, **_kwargs):
+        checkpoint(cancel)
+
+    _cb.__name__ = f"cancel_check_{stage}"
+    return _cb
+
+
+def _slsqp(a: np.ndarray, p: np.ndarray, d: np.ndarray,
+           cancel: CancelToken | None = None) -> np.ndarray:
     n = d.size
     constraints = {"type": "eq", "fun": lambda w: a @ w - p, "jac": lambda w: a}
     w0 = np.minimum(np.maximum(d.copy(), 0.5 * d), 2.0 * d)
@@ -192,15 +226,19 @@ def _slsqp(a: np.ndarray, p: np.ndarray, d: np.ndarray) -> np.ndarray:
         method="SLSQP",
         bounds=[(float(0.5 * d[i]), float(2.0 * d[i])) for i in range(n)],
         constraints=[constraints],
+        callback=_scipy_callback("slsqp", cancel),
         options={"maxiter": 1000, "ftol": 1e-14},
     )
+    # 底层调用返回后立即检查，再解释结果
+    checkpoint(cancel)
     if not res.success:
         raise SolverError(f"SLSQP 未收敛: {res.message}")
     return np.asarray(res.x, dtype=float)
 
 
 def _active_set_refine(
-    w: np.ndarray, a: np.ndarray, p: np.ndarray, d: np.ndarray
+    w: np.ndarray, a: np.ndarray, p: np.ndarray, d: np.ndarray,
+    cancel: CancelToken | None = None,
 ) -> np.ndarray:
     """活动集 KKT 精修：在活动约束（等式 + 活动边界）上解 KKT 线性系统。
 
@@ -215,6 +253,7 @@ def _active_set_refine(
     w = w.copy()
 
     for _ in range(200):
+        checkpoint(cancel)
         # 1) 边界违反者直接纳入活动集
         active_lo |= w <= lower + 1e-9
         active_hi |= w >= upper - 1e-9
@@ -278,7 +317,8 @@ def _active_set_refine(
     raise SolverError("活动集精修迭代未收敛")
 
 
-def _trust_constr(a: np.ndarray, p: np.ndarray, d: np.ndarray) -> np.ndarray:
+def _trust_constr(a: np.ndarray, p: np.ndarray, d: np.ndarray,
+                  cancel: CancelToken | None = None) -> np.ndarray:
     from scipy.optimize import LinearConstraint, Bounds
 
     n = d.size
@@ -289,9 +329,11 @@ def _trust_constr(a: np.ndarray, p: np.ndarray, d: np.ndarray) -> np.ndarray:
         method="trust-constr",
         bounds=Bounds(0.5 * d, 2.0 * d),
         constraints=[LinearConstraint(a, p, p)],
+        callback=_scipy_callback("trust-constr", cancel),
         options={"maxiter": 1000, "gtol": 1e-12, "xtol": 1e-12,
                  "barrier_tol": 1e-12, "verbose": 0},
     )
+    checkpoint(cancel)
     if not res.success:
         raise SolverError(f"trust-constr 未收敛: {res.message}")
     return np.asarray(res.x, dtype=float)
@@ -329,8 +371,15 @@ def kkt_check(a: np.ndarray, p: np.ndarray, d: np.ndarray,
     return resid, sign_ok
 
 
-def solve_qp(samples: list[dict], targets: list[dict]) -> QPResult:
-    """完整求解流程：先 LP 判可行性，再 QP 求最优权重。"""
+def solve_qp(samples: list[dict], targets: list[dict],
+             cancel: CancelToken | None = None) -> QPResult:
+    """完整求解流程：先 LP 判可行性，再 QP 求最优权重。
+
+    ``cancel`` 已取消时在任一根可中断点抛出
+    :class:`app.cancellation.JobCancelled`，调用方据此立即退出，
+    既不写结果也不继续后续阶段。
+    """
+    checkpoint(cancel)
     d = np.array([float(s["d"]) for s in samples], dtype=float)
     a, p = build_matrix(samples, targets)
 
@@ -347,17 +396,18 @@ def solve_qp(samples: list[dict], targets: list[dict]) -> QPResult:
         )
 
     # 1) 可行性独立判定（数值失败抛 SolverError，不混同于不可行）
-    feas = lp_feasible(a, p, d)
+    feas = lp_feasible(a, p, d, cancel=cancel)
     if not feas.feasible:
-        iis = find_iis(a, p, d)
+        iis = find_iis(a, p, d, cancel=cancel)
         return QPResult(status="infeasible", infeasible_targets=iis)
 
     # 2) QP 数值求解，多策略兜底
     attempts: list[str] = []
     w: np.ndarray | None = None
     for name, fn in (("SLSQP", _slsqp), ("trust-constr", _trust_constr)):
+        checkpoint(cancel)
         try:
-            w_try = fn(a, p, d)
+            w_try = fn(a, p, d, cancel)
             w_try = np.clip(w_try, 0.5 * d, 2.0 * d)
             l1, mx = _residuals(w_try, a, p)
             if mx <= RESIDUAL_TOL:
@@ -367,7 +417,7 @@ def solve_qp(samples: list[dict], targets: list[dict]) -> QPResult:
             attempts.append(f"{name}:residual={mx:.2e}")
             # 残差不达标 -> 活动集精修
             try:
-                w_ref = _active_set_refine(w_try, a, p, d)
+                w_ref = _active_set_refine(w_try, a, p, d, cancel)
                 l1, mx = _residuals(w_ref, a, p)
                 if mx <= RESIDUAL_TOL:
                     w = w_ref
@@ -378,9 +428,12 @@ def solve_qp(samples: list[dict], targets: list[dict]) -> QPResult:
                 attempts.append(f"{name}+activeset:fail({exc})")
         except SolverError as exc:
             attempts.append(f"{name}:fail({exc})")
+        except JobCancelled:
+            raise
         except Exception as exc:  # pragma: no cover - 防御性
             attempts.append(f"{name}:error({type(exc).__name__}:{exc})")
 
+    checkpoint(cancel)
     if w is None:
         return QPResult(
             status="failed",
